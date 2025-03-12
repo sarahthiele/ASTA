@@ -6,12 +6,64 @@ import os
 import cv2
 from astropy.io import fits
 import tensorflow as tf
+import sys
 from astropy.visualization import ZScaleInterval
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import pandas as pd
 import argparse
 import time
+import matplotlib.pyplot as plt
+
+
+
+#subclass that ignores the 'groups' argument.
+class Conv2DTransposeGroups(tf.keras.layers.Conv2DTranspose):
+    def __init__(
+        self,
+        filters,
+        kernel_size,
+        strides=(1, 1),
+        padding='valid',
+        output_padding=None,
+        data_format=None,
+        dilation_rate=(1, 1),
+        activation=None,
+        use_bias=True,
+        kernel_initializer='glorot_uniform',
+        bias_initializer='zeros',
+        kernel_regularizer=None,
+        bias_regularizer=None,
+        activity_regularizer=None,
+        kernel_constraint=None,
+        bias_constraint=None,
+        # Accept 'groups' as a parameter, default=1, and ignore it:
+        groups=1,
+        **kwargs
+    ):
+        # nothing special done with 'groups'
+        super().__init__(
+            filters=filters,
+            kernel_size=kernel_size,
+            strides=strides,
+            padding=padding,
+            output_padding=output_padding,
+            data_format=data_format,
+            dilation_rate=dilation_rate,
+            activation=activation,
+            use_bias=use_bias,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            kernel_regularizer=kernel_regularizer,
+            bias_regularizer=bias_regularizer,
+            activity_regularizer=activity_regularizer,
+            kernel_constraint=kernel_constraint,
+            bias_constraint=bias_constraint,
+            **kwargs
+        )
+
+
+
 
 class ASTA:
     def __init__(self, model_path):
@@ -22,7 +74,10 @@ class ASTA:
         model_path (str): Path to the pre-trained model file.
         """
         self.model = tf.keras.models.load_model(model_path, custom_objects={'dice_BCE_loss': self.dice_BCE_loss,
-                                                                            'dice_coeff': self.dice_coeff})
+                                                                            'dice_coeff': self.dice_coeff,
+                                                                            'LeakyReLU': tf.keras.layers.LeakyReLU,
+                                                                            'Conv2DTranspose': Conv2DTransposeGroups},
+                                                compile=False)
 
     def zscale_image(self, image_data):
         """
@@ -276,12 +331,19 @@ class ASTA:
         batch_indices = []
         for i in range(0, full_field_image_standardized.shape[0], patch_size):
             for j in range(0, full_field_image_standardized.shape[1], patch_size):
-                image_patch = full_field_image_standardized[i:i + patch_size, j:j + patch_size]
-                batch_patches.append(image_patch)
-                batch_indices.append((i, j))
+                patch = full_field_image_standardized[i:i+patch_size, j:j+patch_size]
+                padded_patch = np.zeros((patch_size, patch_size), dtype=patch.dtype)
+                padded_patch[:patch.shape[0], :patch.shape[1]] = patch
+                
+                # Save the padded patch
+                batch_patches.append(padded_patch)
+                
+                # Save the coordinates for placing predictions back
+                batch_indices.append((i, j, patch.shape[0], patch.shape[1]))
 
-        # Convert list to numpy array
         batch_patches = np.array(batch_patches)
+
+
 
         if time_processing:
             times["preprocessing"] = time.time() - start_preprocessing_time
@@ -294,8 +356,13 @@ class ASTA:
         batch_predictions = self.predict_on_batch(batch_patches)
 
         # Place predicted patches back into the full predicted mask
-        for idx, (i, j) in enumerate(batch_indices):
-            full_predicted_mask[i:i + patch_size, j:j + patch_size] = batch_predictions[idx]
+        for idx, (i, j, real_height, real_width) in enumerate(batch_indices):
+            pred_patch = batch_predictions[idx]
+            
+            # Place only the region that belongs back into the image
+            # e.g. if real_height=300 at the bottom, we use [i:i+300].
+            full_predicted_mask[i:i+real_height, j:j+real_width] = pred_patch[:real_height, :real_width]
+
 
         if time_processing:
             times["prediction"] = time.time() - start_prediction_time
@@ -512,20 +579,45 @@ if __name__ == "__main__":
             header = hdul[-1].header
             full_field_image = hdul[-1].data
 
+        #base file name from the fits
+        base_filename = os.path.splitext(os.path.basename(args.fits_file_path))[0]
+
+        scaled_image = processor.zscale_image(full_field_image)
+
+
+        os.makedirs(args.image_output_dir, exist_ok=True)
+
+        #save to png
+        out_path = os.path.join(args.image_output_dir, f"{base_filename}_original.png")
+        plt.imsave(out_path, scaled_image, cmap="gray")
+        print(f"Original FITS image saved to {out_path}")
+
         binary_img, df, predicted_mask, times = processor.process_image(
-            full_field_image, header, unet_threshold=args.unet_threshold,
-            save_predicted_mask=args.save_predicted_mask, time_processing=args.time_processing
+            full_field_image, header,
+            unet_threshold=args.unet_threshold,
+            save_predicted_mask=args.save_predicted_mask,
+            time_processing=args.time_processing
         )
 
         if args.time_processing:
             print("Processing times:", times)
 
+        if df.empty:
+            print("No trails were detected.")
+        else:
+            print("Detected trails:")
+            print(df)
+
         if args.save:
-            base_filename = os.path.splitext(os.path.basename(args.fits_file_path))[0]
             processor.save_results(
-                df, base_filename, args.csv_output_dir, args.image_output_dir,
-                save_mask=args.save_mask, mask_image=binary_img,
-                save_predicted_mask=args.save_predicted_mask, predicted_mask=predicted_mask
+                df,
+                base_filename,
+                args.csv_output_dir,
+                args.image_output_dir,
+                save_mask=args.save_mask,
+                mask_image=binary_img,
+                save_predicted_mask=args.save_predicted_mask,
+                predicted_mask=predicted_mask
             )
     else:
         print(f"FITS file {args.fits_file_path} does not exist.")

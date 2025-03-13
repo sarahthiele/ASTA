@@ -621,3 +621,4 @@ if __name__ == "__main__":
             )
     else:
         print(f"FITS file {args.fits_file_path} does not exist.")
+
